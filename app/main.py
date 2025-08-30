@@ -20,7 +20,7 @@ class Handler:
                 self.handle_set(connection, data)
             elif data.startswith(b"*2\r\n$3\r\nGET"):
                 self.handle_get(connection, data)
-            elif data.startswith(b"*3\r\n$5\r\nRPUSH"):
+            elif b"\r\n$5\r\nRPUSH\r\n" in data:
                 self.handle_rpush(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")

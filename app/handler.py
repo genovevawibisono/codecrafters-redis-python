@@ -28,7 +28,7 @@ class Handler:
                 self.handle_lpush(connection, data)
             elif data.startswith(b"*2\r\n$4\r\nLLEN"):
                 self.handle_llen(connection, data)
-            elif data.startswith(b"*2\r\n$4\r\nLPOP"):
+            elif b"\r\n$4\r\nLPOP\r\n" in data or data.startswith(b"*2\r\n$4\r\nLPOP"):
                 self.handle_lpop(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
@@ -246,6 +246,17 @@ class Handler:
                 return
             key_index = dollar_indices[1] + 1
             key = parts[key_index]
+            count = None
+            if (len(dollar_indices) >= 3):
+                count_index = dollar_indices[2] + 1
+                try:
+                    count = int(parts[count_index])
+                    if count <= 0:
+                        connection.sendall(b"-ERR count must be positive\r\n")
+                        return
+                except ValueError:
+                    connection.sendall(b"-ERR count is not an integer\r\n")
+                    return
             entry = self.dictionary.get(key)
             if entry is None:
                 connection.sendall(b"$-1\r\n")
@@ -258,12 +269,25 @@ class Handler:
             if not isinstance(value, list):
                 connection.sendall(b"-ERR wrong type\r\n")
                 return
-            if len(value) == 0:
-                connection.sendall(b"$-1\r\n")
-                return
-            first_element = value.pop(0)
-            self.dictionary[key] = (value, expiry)
-            response = b"$" + str(len(first_element)).encode() + b"\r\n" + first_element + b"\r\n"
-            connection.sendall(response)
+            if count is None:
+                if len(value) == 0:
+                    connection.sendall(b"$-1\r\n")
+                    return
+                first_element = value.pop(0)
+                self.dictionary[key] = (value, expiry)
+                response = b"$" + str(len(first_element)).encode() + b"\r\n" + first_element + b"\r\n"
+                connection.sendall(response)
+            else:
+                if count <= 0 or len(value) == 0:
+                    connection.sendall(b"*0\r\n")
+                    return
+                popped = []
+                for _ in range(min(count, len(value))):
+                    popped.append(value.pop(0))
+                self.dictionary[key] = (value, expiry)
+                response = b"*" + str(len(popped)).encode() + b"\r\n"
+                for item in popped:
+                    response += b"$" + str(len(item)).encode() + b"\r\n" + item + b"\r\n"
+                connection.sendall(response)
         except Exception:
             connection.sendall(b"-ERR error processing 'lop' command\r\n")

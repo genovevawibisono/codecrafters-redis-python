@@ -10,7 +10,7 @@ class Handler:
     def handle(self, connection):
         while True:
             data = connection.recv(1024)
-            if data is None:
+            if not data:
                 break
             if data.startswith(b"*1\r\n$4\r\nPING"):
                 self.handle_ping(connection)
@@ -26,6 +26,8 @@ class Handler:
                 self.handle_lrange(connection, data)
             elif b"\r\n$5\r\nLPUSH\r\n" in data:
                 self.handle_lpush(connection, data)
+            elif data.startswith(b"*2\r\n$4\r\nLLEN"):
+                self.handle_llen(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -111,11 +113,8 @@ class Handler:
             key_index = dollar_indices[1] + 1
             key = parts[key_index]
             # All remaining $ indices are values
-            values = []
-            for i in range(2, len(dollar_indices)):
-                value_index = dollar_indices[i] + 1
-                values.append(parts[value_index])
-            # Store or update the list in the dictionary
+            values = [parts[dollar_indices[i] + 1] for i in range(2, len(dollar_indices))]
+            values = [v for v in values if v != b'']
             entry = self.dictionary.get(key)
             if entry is not None:
                 current_value, expiry = entry
@@ -128,7 +127,6 @@ class Handler:
                 lst = values
                 expiry = None
             self.dictionary[key] = (lst, expiry)
-            # Respond with the length of the list
             response = b":" + str(len(lst)).encode() + b"\r\n"
             connection.sendall(response)
         except Exception:
@@ -188,7 +186,8 @@ class Handler:
             values = []
             for i in range(2, len(dollar_indices)):
                 value_index = dollar_indices[i] + 1
-                values.append(parts[value_index])
+                if value_index < len(parts):
+                    values.append(parts[value_index])
             # Store or update the list in the dictionary
             entry = self.dictionary.get(key)
             if entry is not None:
@@ -208,6 +207,33 @@ class Handler:
             connection.sendall(response)
         except Exception:
             connection.sendall(b"-ERR error processing 'lpush' command\r\n")
+
+    def handle_llen(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            if len(dollar_indices) < 2:
+                connection.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
+                return
+            key_index = dollar_indices[1] + 1
+            key = parts[key_index]
+            entry = self.dictionary.get(key)
+            if entry is None:
+                connection.sendall(b":0\r\n")
+                return
+            value, expiry = entry
+            # Check expiry for lists as well
+            if expiry is not None and time.time() > expiry:
+                del self.dictionary[key]
+                connection.sendall(b":0\r\n")
+                return
+            if not isinstance(value, list):
+                connection.sendall(b"-ERR wrong type\r\n")
+                return
+            response = b":" + str(len(value)).encode() + b"\r\n"
+            connection.sendall(response)
+        except Exception:
+            connection.sendall(b"-ERR error processing 'llen' command\r\n")
 
 
 def main():

@@ -1,20 +1,22 @@
+import time
 import socket  # noqa: F401
 import threading
 
 class Handler:
     def __init__(self):
+        # Store value and expiry (None or timestamp in seconds)
         self.dictionary = dict()
 
     def handle(self, connection):
         while True:
             data = connection.recv(1024)
-            if data == None:
+            if data is None:
                 break
             if data.startswith(b"*1\r\n$4\r\nPING"):
                 self.handle_ping(connection)
             elif data.startswith(b"*2\r\n$4\r\nECHO"):
                 self.handle_echo(connection, data)
-            elif data.startswith(b"*3\r\n$3\r\nSET"):
+            elif data.startswith(b"*3\r\n$3\r\nSET") or data.startswith(b"*5\r\n$3\r\nSET"):
                 self.handle_set(connection, data)
             elif data.startswith(b"*2\r\n$3\r\nGET"):
                 self.handle_get(connection, data)
@@ -22,16 +24,12 @@ class Handler:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
 
-
     def handle_ping(self, connection):
         connection.sendall(b"+PONG\r\n")
 
-
     def handle_echo(self, connection, data):
         parts = data.split(b"\r\n")
-        # Find the index of the argument length and value
         try:
-            # Find the index of the second '$'
             dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
             if len(dollar_indices) >= 2:
                 arg_index = dollar_indices[1] + 1
@@ -43,8 +41,7 @@ class Handler:
         except Exception:
             connection.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
 
-
-    def handle_set(self,connection, data):
+    def handle_set(self, connection, data):
         parts = data.split(b"\r\n")
         try:
             dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
@@ -53,14 +50,25 @@ class Handler:
                 value_index = dollar_indices[2] + 1
                 key = parts[key_index]
                 value = parts[value_index]
-                # Store key and value in Handle's dictionary
-                self.dictionary[key] = value
+                expiry = None
+                # Check for PX argument
+                if len(dollar_indices) >= 5:
+                    px_index = dollar_indices[3] + 1
+                    px_value_index = dollar_indices[4] + 1
+                    if parts[px_index].upper() == b"PX":
+                        try:
+                            ms = int(parts[px_value_index])
+                            expiry = time.time() + ms / 1000.0
+                        except Exception:
+                            connection.sendall(b"-ERR PX value is not an integer\r\n")
+                            return
+                # Store value and expiry (None if not set)
+                self.dictionary[key] = (value, expiry)
                 connection.sendall(b"+OK\r\n")
             else:
                 connection.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
         except Exception:
             connection.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
-
 
     def handle_get(self, connection, data):
         parts = data.split(b"\r\n")
@@ -69,13 +77,19 @@ class Handler:
             if len(dollar_indices) >= 2:
                 key_index = dollar_indices[1] + 1
                 key = parts[key_index]
-                value = self.dictionary.get(key, None)
-                if value is None:
+                entry = self.dictionary.get(key, None)
+                if entry is None:
                     connection.sendall(b"$-1\r\n")
                     return
-                else:
-                    response = b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
-                    connection.sendall(response)
+                value, expiry = entry
+                # Check expiry
+                if expiry is not None and time.time() > expiry:
+                    # Key expired, remove it
+                    del self.dictionary[key]
+                    connection.sendall(b"$-1\r\n")
+                    return
+                response = b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+                connection.sendall(response)
             else:
                 connection.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
         except Exception:

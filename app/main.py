@@ -6,8 +6,34 @@ def handle(connection):
         data = connection.recv(1024)
         if data == None:
             break
-        connection.sendall(b"+PONG\r\n")
+        if data.startswith(b"*1\r\n$4\r\nPING"):
+            handle_ping(connection)
+        elif data.startswith(b"*2\r\n$4\r\nECHO"):
+            handle_echo(connection, data)
+        else:
+            connection.sendall(b"-ERR unknown command\r\n")
     connection.close()
+
+
+def handle_ping(connection):
+    connection.sendall(b"+PONG\r\n")
+
+
+def handle_echo(connection, data):
+    parts = data.split(b"\r\n")
+    # Find the index of the argument length and value
+    try:
+        # Find the index of the second '$'
+        dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+        if len(dollar_indices) >= 2:
+            arg_index = dollar_indices[1] + 1
+            message = parts[arg_index]
+            response = b"$" + str(len(message)).encode() + b"\r\n" + message + b"\r\n"
+            connection.sendall(response)
+        else:
+            connection.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
+    except Exception:
+        connection.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
 
 
 def main():
@@ -21,6 +47,7 @@ def main():
         connection, _ = server_socket.accept() # wait for client
         client_thread = threading.Thread(target=handle, args=(connection,))
         client_thread.start()
+
 
 if __name__ == "__main__":
     main()

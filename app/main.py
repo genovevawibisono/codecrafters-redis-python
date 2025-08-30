@@ -22,6 +22,8 @@ class Handler:
                 self.handle_get(connection, data)
             elif b"\r\n$5\r\nRPUSH\r\n" in data:
                 self.handle_rpush(connection, data)
+            elif b"\r\n$6\r\nLRANGE\r\n" in data:
+                self.handle_lrange(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -129,6 +131,47 @@ class Handler:
             connection.sendall(response)
         except Exception:
             connection.sendall(b"-ERR error processing 'rpush' command\r\n")
+
+    def handle_lrange(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            if len(dollar_indices) < 4:
+                connection.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
+                return
+            key_index = dollar_indices[1] + 1
+            start_index = dollar_indices[2] + 1
+            end_index = dollar_indices[3] + 1
+            key = parts[key_index]
+            try:
+                start = int(parts[start_index])
+                end = int(parts[end_index])
+            except ValueError:
+                connection.sendall(b"-ERR start or end is not an integer\r\n")
+                return
+            entry = self.dictionary.get(key)
+            if entry is None:
+                connection.sendall(b"*0\r\n")
+                return
+            value, expiry = entry
+            if not isinstance(value, list):
+                connection.sendall(b"-ERR wrong type\r\n")
+                return
+            # Handle negative indices
+            if start < 0:
+                start += len(value)
+            if end < 0:
+                end += len(value)
+            # Adjust end to be inclusive
+            end += 1
+            # Slice the list safely
+            sliced = value[max(0, start):min(len(value), end)]
+            response = b"*" + str(len(sliced)).encode() + b"\r\n"
+            for item in sliced:
+                response += b"$" + str(len(item)).encode() + b"\r\n" + item + b"\r\n"
+            connection.sendall(response)
+        except Exception:
+            connection.sendall(b"-ERR error processing 'lrange' command\r\n")
 
 
 def main():

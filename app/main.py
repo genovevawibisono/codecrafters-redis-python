@@ -24,6 +24,8 @@ class Handler:
                 self.handle_rpush(connection, data)
             elif b"\r\n$6\r\nLRANGE\r\n" in data:
                 self.handle_lrange(connection, data)
+            elif b"\r\n$5\r\nLPUSH\r\n" in data:
+                self.handle_lpush(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -172,6 +174,40 @@ class Handler:
             connection.sendall(response)
         except Exception:
             connection.sendall(b"-ERR error processing 'lrange' command\r\n")
+
+    def handle_lpush(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            if len(dollar_indices) < 3:
+                connection.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
+                return
+            key_index = dollar_indices[1] + 1
+            key = parts[key_index]
+            # All remaining $ indices are values
+            values = []
+            for i in range(2, len(dollar_indices)):
+                value_index = dollar_indices[i] + 1
+                values.append(parts[value_index])
+            # Store or update the list in the dictionary
+            entry = self.dictionary.get(key)
+            if entry is not None:
+                current_value, expiry = entry
+                if not isinstance(current_value, list):
+                    connection.sendall(b"-ERR wrong type\r\n")
+                    return
+                for v in values:
+                    current_value.insert(0, v)
+                lst = current_value
+            else:
+                lst = list(reversed(values))
+                expiry = None
+            self.dictionary[key] = (lst, expiry)
+            # Respond with the length of the list
+            response = b":" + str(len(lst)).encode() + b"\r\n"
+            connection.sendall(response)
+        except Exception:
+            connection.sendall(b"-ERR error processing 'lpush' command\r\n")
 
 
 def main():

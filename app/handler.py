@@ -1,11 +1,11 @@
 import time
-import socket  # noqa: F401
 import threading
 
 class Handler:
     def __init__(self):
         # Store value and expiry (None or timestamp in seconds)
         self.dictionary = dict()
+        self.lock = threading.Lock()
 
     def handle(self, connection):
         while True:
@@ -30,7 +30,7 @@ class Handler:
                 self.handle_llen(connection, data)
             elif b"\r\n$4\r\nLPOP\r\n" in data or data.startswith(b"*2\r\n$4\r\nLPOP"):
                 self.handle_lpop(connection, data)
-            elif data.startswith(b"*3\r\n$5\r\nBLPOP"):
+            elif b"BLPOP" in data:
                 self.handle_blpop(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
@@ -312,24 +312,29 @@ class Handler:
             start_time = time.time()
             while True:
                 for key in keys:
-                    entry = self.dictionary.get(key)
-                    if entry is not None:
-                        value, expiry = entry
-                        if expiry is not None and time.time() > expiry:
-                            del self.dictionary[key]
-                            continue
-                        if not isinstance(value, list):
-                            connection.sendall(b"-ERR wrong type\r\n")
-                            return
-                        if len(value) > 0:
-                            first_element = value.pop(0)
-                            self.dictionary[key] = (value, expiry)
-                            response = b"*" + b"2" + b"\r\n" + b"$" + str(len(key)).encode() + b"\r\n" + key + b"\r\n" + b"$" + str(len(first_element)).encode() + b"\r\n" + first_element + b"\r\n"
-                            connection.sendall(response)
-                            return
+                    with self.lock:
+                        entry = self.dictionary.get(key)
+                        if entry is not None:
+                            value, expiry = entry
+                            if expiry is not None and time.time() > expiry:
+                                del self.dictionary[key]
+                                continue
+                            if not isinstance(value, list):
+                                connection.sendall(b"-ERR wrong type\r\n")
+                                return
+                            if len(value) > 0:
+                                first_element = value.pop(0)
+                                self.dictionary[key] = (value, expiry)
+                                response = (
+                                    b"*2\r\n"
+                                    + b"$" + str(len(key)).encode() + b"\r\n" + key + b"\r\n"
+                                    + b"$" + str(len(first_element)).encode() + b"\r\n" + first_element + b"\r\n"
+                                )
+                                connection.sendall(response)
+                                return
                 if timeout > 0 and (time.time() - start_time) >= timeout:
-                    connection.sendall(b"$-1\r\n")
+                    connection.sendall(b"*-1\r\n")
                     return
-                time.sleep(0.1)
+                time.sleep(0.01)
         except Exception:
             connection.sendall(b"-ERR error processing 'blpop' command\r\n")

@@ -38,6 +38,8 @@ class Handler:
                 self.handle_type(connection, data)
             elif b"XADD" in data:
                 self.handle_xadd(connection, data)
+            elif b"XRANGE" in data:
+                self.handle_xrange(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -556,4 +558,78 @@ class Handler:
             return b"$-1\r\n"
         value_str = str(value)
         return f"${len(value_str)}\r\n{value_str}\r\n"
+    
+    def handle_xrange(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            if len(dollar_indices) < 4:
+                connection.sendall(b"-ERR wrong number of arguments for 'xrange' command\r\n")
+                return
             
+            stream_index = dollar_indices[1] + 1
+            start_index = dollar_indices[2] + 1
+            end_index = dollar_indices[3] + 1
+            
+            stream_name = parts[stream_index]
+            start = parts[start_index]
+            end = parts[end_index]
+            
+            if stream_name not in self.streams:
+                connection.sendall(b"*0\r\n")
+                return
+            
+            entries = self.streams[stream_name]
+            result_entries = []
+            
+            for entry_id, fields in entries:
+                if self.__check_id_in_range(entry_id, start, end):
+                    result_entries.append((entry_id, fields))
+            
+            response = b"*" + str(len(result_entries)).encode() + b"\r\n"
+            for entry_id, fields in result_entries:
+                response += b"*2\r\n"
+                response += b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
+                response += b"*" + str(len(fields) * 2).encode() + b"\r\n"
+                for field, value in fields.items():
+                    response += b"$" + str(len(field)).encode() + b"\r\n" + field + b"\r\n"
+                    response += b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+            
+            connection.sendall(response)
+        except Exception:
+            connection.sendall(b"-ERR error processing 'xrange' command\r\n")
+
+    def __check_id_in_range(self, entry_id, start, end):
+        # Handle special cases for start and end
+        if start == b"-":
+            start_ok = True
+        else:
+            # entry_id >= start (entry_id is greater than or equal to start)
+            start_ok = self.__check_id_greater_than_or_equal(entry_id, start)
+        
+        if end == b"+":
+            end_ok = True
+        else:
+            # entry_id <= end (entry_id is less than or equal to end)
+            end_ok = self.__check_id_less_than_or_equal(entry_id, end)
+        
+        return start_ok and end_ok
+
+    def __check_id_greater_than_or_equal(self, id1, id2):
+        """Check if id1 >= id2"""
+        return self.__check_id_greater_than(id1, id2) or self.__check_id_equal(id1, id2)
+
+    def __check_id_less_than_or_equal(self, id1, id2):
+        """Check if id1 <= id2"""
+        return self.__check_id_greater_than(id2, id1) or self.__check_id_equal(id1, id2)
+
+    def __check_id_equal(self, id1, id2):
+        """Check if two IDs are equal"""
+        if not self.__validate_stream_id(id1) or not self.__validate_stream_id(id2):
+            return False
+        
+        t1, s1 = id1.split(b"-", 1)
+        t2, s2 = id2.split(b"-", 1)
+        
+        return int(t1) == int(t2) and int(s1) == int(s2)
+                

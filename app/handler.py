@@ -659,13 +659,9 @@ class Handler:
             # Parse command arguments
             cmd_index = dollar_indices[0] + 1  # Should be "XREAD"
             streams_index = dollar_indices[1] + 1  # Should be "streams"
-            stream_key_index = dollar_indices[2] + 1
-            start_id_index = dollar_indices[3] + 1
             
             cmd = parts[cmd_index]
             streams_keyword = parts[streams_index]
-            stream_key = parts[stream_key_index]
-            start_id = parts[start_id_index]
             
             # Validate command format
             if cmd.upper() != b"XREAD":
@@ -676,59 +672,92 @@ class Handler:
                 connection.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
                 return
             
-            # Check if stream exists
-            if stream_key not in self.streams:
-                # Return empty array if stream doesn't exist
+            # Parse multiple streams and their start IDs
+            # Format: XREAD streams stream1 stream2 ... streamN id1 id2 ... idN
+            # Arguments after "streams": [stream1, stream2, ..., streamN, id1, id2, ..., idN]
+            stream_args = []
+            for i in range(2, len(dollar_indices)):
+                arg_index = dollar_indices[i] + 1
+                stream_args.append(parts[arg_index])
+            
+            # Must have even number of arguments (equal streams and IDs)
+            if len(stream_args) % 2 != 0:
+                connection.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
+                return
+            
+            num_streams = len(stream_args) // 2
+            stream_keys = stream_args[:num_streams]
+            start_ids = stream_args[num_streams:]
+            
+            # Process each stream
+            result_streams = []
+            for i in range(num_streams):
+                stream_key = stream_keys[i]
+                start_id = start_ids[i]
+                
+                # Check if stream exists
+                if stream_key not in self.streams:
+                    continue  # Skip non-existent streams
+                
+                # Find entries with ID greater than start_id (exclusive)
+                matching_entries = []
+                for entry_id, fields in self.streams[stream_key]:
+                    if self.__check_id_greater_than(entry_id, start_id):
+                        matching_entries.append((entry_id, fields))
+                
+                # Only include streams that have matching entries
+                if matching_entries:
+                    result_streams.append((stream_key, matching_entries))
+            
+            # Build response for multiple streams
+            if not result_streams:
+                # Return empty array if no streams have matching entries
                 connection.sendall(b"*0\r\n")
                 return
             
-            # Find entries with ID greater than start_id (exclusive)
-            matching_entries = []
-            for entry_id, fields in self.streams[stream_key]:
-                if self.__check_id_greater_than(entry_id, start_id):
-                    matching_entries.append((entry_id, fields))
-            
-            # Build response
-            if not matching_entries:
-                # Return empty array if no matching entries
-                connection.sendall(b"*0\r\n")
-                return
-            
-            # Build XREAD response format
-            response = self.__build_xread_response(stream_key, matching_entries)
+            # Build XREAD response format for multiple streams
+            response = self.__build_xread_multi_response(result_streams)
             connection.sendall(response)
             
         except Exception as e:
             connection.sendall(b"-ERR error processing 'xread' command\r\n")
 
-    def __build_xread_response(self, stream_key, entries):
-        """Build RESP response for XREAD command"""
-        # Format: *1\r\n*2\r\n$<key_len>\r\n<key>\r\n*<entry_count>\r\n...
+    # Add this method to your Handler class
+    def __build_xread_multi_response(self, result_streams):
+        """Build RESP response for XREAD command with multiple streams"""
+        # Format: *<stream_count>\r\n for each stream: *2\r\n$<key_len>\r\n<key>\r\n*<entry_count>\r\n...
         
-        response = b"*1\r\n"  # Array with 1 stream
-        response += b"*2\r\n"  # Each stream has 2 elements: [name, entries]
+        response = b"*" + str(len(result_streams)).encode() + b"\r\n"  # Array with N streams
         
-        # Stream name
-        response += b"$" + str(len(stream_key)).encode() + b"\r\n" + stream_key + b"\r\n"
-        
-        # Entries array
-        response += b"*" + str(len(entries)).encode() + b"\r\n"
-        
-        for entry_id, fields in entries:
-            # Each entry is an array with 2 elements: [id, [field1, value1, field2, value2, ...]]
-            response += b"*2\r\n"
+        for stream_key, entries in result_streams:
+            response += b"*2\r\n"  # Each stream has 2 elements: [name, entries]
             
-            # Entry ID
-            response += b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
+            # Stream name
+            response += b"$" + str(len(stream_key)).encode() + b"\r\n" + stream_key + b"\r\n"
             
-            # Fields array (flattened field-value pairs)
-            field_count = len(fields) * 2  # Each field-value pair becomes 2 elements
-            response += b"*" + str(field_count).encode() + b"\r\n"
+            # Entries array
+            response += b"*" + str(len(entries)).encode() + b"\r\n"
             
-            for field, value in fields.items():
-                # Field name
-                response += b"$" + str(len(field)).encode() + b"\r\n" + field + b"\r\n"
-                # Field value
-                response += b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+            for entry_id, fields in entries:
+                # Each entry is an array with 2 elements: [id, [field1, value1, field2, value2, ...]]
+                response += b"*2\r\n"
+                
+                # Entry ID
+                response += b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
+                
+                # Fields array (flattened field-value pairs)
+                field_count = len(fields) * 2  # Each field-value pair becomes 2 elements
+                response += b"*" + str(field_count).encode() + b"\r\n"
+                
+                for field, value in fields.items():
+                    # Field name
+                    response += b"$" + str(len(field)).encode() + b"\r\n" + field + b"\r\n"
+                    # Field value
+                    response += b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
         
         return response
+
+    def __build_xread_response(self, stream_key, entries):
+        """Build RESP response for XREAD command (single stream - kept for compatibility)"""
+        # This is now just a wrapper around the multi-stream version
+        return self.__build_xread_multi_response([(stream_key, entries)])

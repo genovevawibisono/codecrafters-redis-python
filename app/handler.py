@@ -658,25 +658,53 @@ class Handler:
             
             # Parse command arguments
             cmd_index = dollar_indices[0] + 1  # Should be "XREAD"
-            streams_index = dollar_indices[1] + 1  # Should be "streams"
-            
             cmd = parts[cmd_index]
-            streams_keyword = parts[streams_index]
             
             # Validate command format
             if cmd.upper() != b"XREAD":
                 connection.sendall(b"-ERR unknown command 'xread'\r\n")
                 return
+            
+            # Check for BLOCK option
+            block_timeout = None
+            arg_start_index = 1  # Start parsing from second argument
+            
+            # Check if second argument is "BLOCK"
+            if len(dollar_indices) >= 2:
+                second_arg_index = dollar_indices[1] + 1
+                if parts[second_arg_index].upper() == b"BLOCK":
+                    # BLOCK timeout is the next argument
+                    if len(dollar_indices) < 3:
+                        connection.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
+                        return
+                        
+                    timeout_index = dollar_indices[2] + 1
+                    try:
+                        timeout_ms = int(parts[timeout_index])
+                        if timeout_ms == 0:
+                            block_timeout = float('inf')  # Block indefinitely
+                        else:
+                            block_timeout = timeout_ms / 1000.0  # Convert to seconds
+                        arg_start_index = 3  # Skip BLOCK and timeout arguments
+                    except ValueError:
+                        connection.sendall(b"-ERR timeout is not an integer or out of range\r\n")
+                        return
+            
+            # Parse "streams" keyword
+            if len(dollar_indices) <= arg_start_index:
+                connection.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
+                return
                 
+            streams_index = dollar_indices[arg_start_index] + 1
+            streams_keyword = parts[streams_index]
+            
             if streams_keyword.upper() != b"STREAMS":
                 connection.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
                 return
             
             # Parse multiple streams and their start IDs
-            # Format: XREAD streams stream1 stream2 ... streamN id1 id2 ... idN
-            # Arguments after "streams": [stream1, stream2, ..., streamN, id1, id2, ..., idN]
             stream_args = []
-            for i in range(2, len(dollar_indices)):
+            for i in range(arg_start_index + 1, len(dollar_indices)):
                 arg_index = dollar_indices[i] + 1
                 stream_args.append(parts[arg_index])
             
@@ -689,11 +717,72 @@ class Handler:
             stream_keys = stream_args[:num_streams]
             start_ids = stream_args[num_streams:]
             
-            # Process each stream
+            # If blocking, implement blocking logic
+            if block_timeout is not None:
+                self.__handle_blocking_xread(connection, stream_keys, start_ids, block_timeout)
+            else:
+                # Non-blocking read (original logic)
+                self.__handle_non_blocking_xread(connection, stream_keys, start_ids)
+                
+        except Exception as e:
+            connection.sendall(b"-ERR error processing 'xread' command\r\n")
+
+    def __handle_non_blocking_xread(self, connection, stream_keys, start_ids):
+        """Handle non-blocking XREAD"""
+        result_streams = []
+        
+        for i in range(len(stream_keys)):
+            stream_key = stream_keys[i]
+            start_id = start_ids[i]
+            
+            # Check if stream exists
+            if stream_key not in self.streams:
+                continue  # Skip non-existent streams
+            
+            # Find entries with ID greater than start_id (exclusive)
+            matching_entries = []
+            for entry_id, fields in self.streams[stream_key]:
+                if self.__check_id_greater_than(entry_id, start_id):
+                    matching_entries.append((entry_id, fields))
+            
+            # Only include streams that have matching entries
+            if matching_entries:
+                result_streams.append((stream_key, matching_entries))
+        
+        # Build response for multiple streams
+        if not result_streams:
+            # Return null array if no streams have matching entries
+            connection.sendall(b"*-1\r\n")
+            return
+        
+        # Build XREAD response format for multiple streams
+        response = self.__build_xread_multi_response(result_streams)
+        connection.sendall(response)
+
+    def __handle_blocking_xread(self, connection, stream_keys, start_ids, block_timeout):
+        """Handle blocking XREAD with timeout"""
+        import time
+        
+        start_time = time.time()
+        
+        while True:
+            # Check for new entries (same logic as non-blocking)
             result_streams = []
-            for i in range(num_streams):
+            
+            for i in range(len(stream_keys)):
                 stream_key = stream_keys[i]
                 start_id = start_ids[i]
+                
+                # Special handling for '$' - means "latest entry ID"
+                if start_id == b'$':
+                    # For blocking, '$' means wait for entries newer than current latest
+                    if stream_key in self.streams and self.streams[stream_key]:
+                        # Get the latest entry ID from the stream
+                        latest_entry_id = self.streams[stream_key][-1][0]
+                        start_id = latest_entry_id
+                    else:
+                        # Stream doesn't exist or is empty, use 0-0
+                        start_id = b'0-0'
                 
                 # Check if stream exists
                 if stream_key not in self.streams:
@@ -709,28 +798,29 @@ class Handler:
                 if matching_entries:
                     result_streams.append((stream_key, matching_entries))
             
-            # Build response for multiple streams
-            if not result_streams:
-                # Return empty array if no streams have matching entries
-                connection.sendall(b"*0\r\n")
+            # If we found results, return them
+            if result_streams:
+                response = self.__build_xread_multi_response(result_streams)
+                connection.sendall(response)
                 return
             
-            # Build XREAD response format for multiple streams
-            response = self.__build_xread_multi_response(result_streams)
-            connection.sendall(response)
+            # Check timeout
+            if block_timeout != float('inf'):
+                elapsed = time.time() - start_time
+                if elapsed >= block_timeout:
+                    # Timeout reached, return null
+                    connection.sendall(b"*-1\r\n")
+                    return
             
-        except Exception as e:
-            connection.sendall(b"-ERR error processing 'xread' command\r\n")
+            # Sleep briefly before checking again
+            time.sleep(0.01)  # 10ms polling interval
 
-    # Add this method to your Handler class
     def __build_xread_multi_response(self, result_streams):
         """Build RESP response for XREAD command with multiple streams"""
-        # Format: *<stream_count>\r\n for each stream: *2\r\n$<key_len>\r\n<key>\r\n*<entry_count>\r\n...
-        
-        response = b"*" + str(len(result_streams)).encode() + b"\r\n"  # Array with N streams
+        response = b"*" + str(len(result_streams)).encode() + b"\r\n"
         
         for stream_key, entries in result_streams:
-            response += b"*2\r\n"  # Each stream has 2 elements: [name, entries]
+            response += b"*2\r\n"
             
             # Stream name
             response += b"$" + str(len(stream_key)).encode() + b"\r\n" + stream_key + b"\r\n"
@@ -739,20 +829,17 @@ class Handler:
             response += b"*" + str(len(entries)).encode() + b"\r\n"
             
             for entry_id, fields in entries:
-                # Each entry is an array with 2 elements: [id, [field1, value1, field2, value2, ...]]
                 response += b"*2\r\n"
                 
                 # Entry ID
                 response += b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
                 
-                # Fields array (flattened field-value pairs)
-                field_count = len(fields) * 2  # Each field-value pair becomes 2 elements
+                # Fields array
+                field_count = len(fields) * 2
                 response += b"*" + str(field_count).encode() + b"\r\n"
                 
                 for field, value in fields.items():
-                    # Field name
                     response += b"$" + str(len(field)).encode() + b"\r\n" + field + b"\r\n"
-                    # Field value
                     response += b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
         
         return response

@@ -40,6 +40,8 @@ class Handler:
                 self.handle_xadd(connection, data)
             elif b"XRANGE" in data:
                 self.handle_xrange(connection, data)
+            elif b"XREAD" in data:
+                self.handle_xread(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -632,4 +634,101 @@ class Handler:
         t2, s2 = id2.split(b"-", 1)
         
         return int(t1) == int(t2) and int(s1) == int(s2)
+    
+    def __upper_bound_xrange(self, ids, start):
+        """Find the index of the first ID greater than start"""
+        low, high = 0, len(ids)
+        while low < high:
+            mid = (low + high) // 2
+            if self.__check_id_greater_than(ids[mid], start):
+                high = mid
+            else:
+                low = mid + 1
+        return low
+    
+    def handle_xread(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            
+            # Minimum: XREAD, streams, stream_key, start_id (4 arguments)
+            if len(dollar_indices) < 4:
+                connection.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
+                return
+            
+            # Parse command arguments
+            cmd_index = dollar_indices[0] + 1  # Should be "XREAD"
+            streams_index = dollar_indices[1] + 1  # Should be "streams"
+            stream_key_index = dollar_indices[2] + 1
+            start_id_index = dollar_indices[3] + 1
+            
+            cmd = parts[cmd_index]
+            streams_keyword = parts[streams_index]
+            stream_key = parts[stream_key_index]
+            start_id = parts[start_id_index]
+            
+            # Validate command format
+            if cmd.upper() != b"XREAD":
+                connection.sendall(b"-ERR unknown command 'xread'\r\n")
+                return
                 
+            if streams_keyword.upper() != b"STREAMS":
+                connection.sendall(b"-ERR wrong number of arguments for 'xread' command\r\n")
+                return
+            
+            # Check if stream exists
+            if stream_key not in self.streams:
+                # Return empty array if stream doesn't exist
+                connection.sendall(b"*0\r\n")
+                return
+            
+            # Find entries with ID greater than start_id (exclusive)
+            matching_entries = []
+            for entry_id, fields in self.streams[stream_key]:
+                if self.__check_id_greater_than(entry_id, start_id):
+                    matching_entries.append((entry_id, fields))
+            
+            # Build response
+            if not matching_entries:
+                # Return empty array if no matching entries
+                connection.sendall(b"*0\r\n")
+                return
+            
+            # Build XREAD response format
+            response = self.__build_xread_response(stream_key, matching_entries)
+            connection.sendall(response)
+            
+        except Exception as e:
+            connection.sendall(b"-ERR error processing 'xread' command\r\n")
+
+    def __build_xread_response(self, stream_key, entries):
+        """Build RESP response for XREAD command"""
+        # Format: *1\r\n*2\r\n$<key_len>\r\n<key>\r\n*<entry_count>\r\n...
+        
+        response = b"*1\r\n"  # Array with 1 stream
+        response += b"*2\r\n"  # Each stream has 2 elements: [name, entries]
+        
+        # Stream name
+        response += b"$" + str(len(stream_key)).encode() + b"\r\n" + stream_key + b"\r\n"
+        
+        # Entries array
+        response += b"*" + str(len(entries)).encode() + b"\r\n"
+        
+        for entry_id, fields in entries:
+            # Each entry is an array with 2 elements: [id, [field1, value1, field2, value2, ...]]
+            response += b"*2\r\n"
+            
+            # Entry ID
+            response += b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
+            
+            # Fields array (flattened field-value pairs)
+            field_count = len(fields) * 2  # Each field-value pair becomes 2 elements
+            response += b"*" + str(field_count).encode() + b"\r\n"
+            
+            for field, value in fields.items():
+                # Field name
+                response += b"$" + str(len(field)).encode() + b"\r\n" + field + b"\r\n"
+                # Field value
+                response += b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+        
+        return response

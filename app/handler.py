@@ -30,6 +30,8 @@ class Handler:
                 self.handle_llen(connection, data)
             elif b"\r\n$4\r\nLPOP\r\n" in data or data.startswith(b"*2\r\n$4\r\nLPOP"):
                 self.handle_lpop(connection, data)
+            elif data.startswith(b"*3\r\n$5\r\nBLPOP"):
+                self.handle_blpop(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -242,7 +244,7 @@ class Handler:
         try:
             dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
             if len(dollar_indices) < 2:
-                connection.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
+                connection.sendall(b"-ERR wrong number of arguments for 'lpop' command\r\n")
                 return
             key_index = dollar_indices[1] + 1
             key = parts[key_index]
@@ -291,3 +293,43 @@ class Handler:
                 connection.sendall(response)
         except Exception:
             connection.sendall(b"-ERR error processing 'lop' command\r\n")
+
+    def handle_blpop(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            if len(dollar_indices) < 3:
+                connection.sendall(b"-ERR wrong number of arguments for 'blpop' command\r\n")
+                return
+            key_indices = [dollar_indices[i] + 1 for i in range(1, len(dollar_indices) - 1)]
+            keys = [parts[i] for i in key_indices]
+            timeout_idx = dollar_indices[-1] + 1
+            try:
+                timeout = float(parts[timeout_idx])
+            except Exception:
+                connection.sendall(b"-ERR timeout is not a float\r\n")
+                return
+            start_time = time.time()
+            while True:
+                for key in keys:
+                    entry = self.dictionary.get(key)
+                    if entry is not None:
+                        value, expiry = entry
+                        if expiry is not None and time.time() > expiry:
+                            del self.dictionary[key]
+                            continue
+                        if not isinstance(value, list):
+                            connection.sendall(b"-ERR wrong type\r\n")
+                            return
+                        if len(value) > 0:
+                            first_element = value.pop(0)
+                            self.dictionary[key] = (value, expiry)
+                            response = b"*" + b"2" + b"\r\n" + b"$" + str(len(key)).encode() + b"\r\n" + key + b"\r\n" + b"$" + str(len(first_element)).encode() + b"\r\n" + first_element + b"\r\n"
+                            connection.sendall(response)
+                            return
+                if timeout > 0 and (time.time() - start_time) >= timeout:
+                    connection.sendall(b"$-1\r\n")
+                    return
+                time.sleep(0.1)
+        except Exception:
+            connection.sendall(b"-ERR error processing 'blpop' command\r\n")

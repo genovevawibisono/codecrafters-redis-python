@@ -1,11 +1,13 @@
 import time
 import threading
+import uuid
 
 class Handler:
     def __init__(self):
         # Store value and expiry (None or timestamp in seconds)
         self.dictionary = dict()
         self.lock = threading.Lock()
+        self.streams = {}
 
     def handle(self, connection):
         while True:
@@ -34,6 +36,8 @@ class Handler:
                 self.handle_blpop(connection, data)
             elif b"TYPE" in data:
                 self.handle_type(connection, data)
+            elif b"XADD" in data:
+                self.handle_xadd(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -350,18 +354,69 @@ class Handler:
                 return
             key_index = dollar_indices[1] + 1
             key = parts[key_index]
-            entry = self.dictionary.get(key)
-            if entry is None:
-                connection.sendall(b"+none\r\n")
+            
+            # Check dictionary first
+            value, expiry = self.__search_dictionary(key)
+            if value is not None:
+                if isinstance(value, list):
+                    connection.sendall(b"+list\r\n")
+                else:
+                    connection.sendall(b"+string\r\n")
                 return
-            value, expiry = entry
-            if expiry is not None and time.time() > expiry:
-                del self.dictionary[key]
-                connection.sendall(b"+none\r\n")
+            
+            # Check streams
+            stream_data = self.__search_stream(key)
+            if stream_data is not None:
+                connection.sendall(b"+stream\r\n")
                 return
-            if isinstance(value, list):
-                connection.sendall(b"+list\r\n")
-            else:
-                connection.sendall(b"+string\r\n")
+            
+            # Key doesn't exist
+            connection.sendall(b"+none\r\n")
         except Exception:
             connection.sendall(b"-ERR error processing 'type' command\r\n")
+
+    def __search_dictionary(self, key):
+        entry = self.dictionary.get(key)
+        if entry is None:
+            return None, None
+        value, expiry = entry
+        if expiry is not None and time.time() > expiry:
+            del self.dictionary[key]
+            return None, None
+        return value, expiry
+    
+    def __search_stream(self, stream_name):
+        if stream_name in self.streams:
+            return self.streams[stream_name]
+        return None
+
+
+    def handle_xadd(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            if len(dollar_indices) < 4:
+                connection.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
+                return
+            stream_index = dollar_indices[1] + 1
+            id_index = dollar_indices[2] + 1
+            field_value_start = dollar_indices[3] + 1
+            stream_name = parts[stream_index]
+            entry_id = parts[id_index]
+            field_value_pairs = {}
+            for i in range(field_value_start, len(parts) - 1, 2):
+                field = parts[i]
+                value = parts[i + 1]
+                field_value_pairs[field] = value
+            if stream_name not in self.streams:
+                self.streams[stream_name] = []
+            if entry_id == b'*':
+                entry_id = uuid.uuid4().hex.encode()
+            entry = (entry_id, field_value_pairs)
+            self.streams[stream_name].append(entry)
+            response = b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
+            connection.sendall(response)
+        except Exception:
+            connection.sendall(b"-ERR error processing 'xadd' command\r\n")         
+
+    

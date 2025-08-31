@@ -32,6 +32,8 @@ class Handler:
                 self.handle_lpop(connection, data)
             elif b"BLPOP" in data:
                 self.handle_blpop(connection, data)
+            elif b"TYPE" in data:
+                self.handle_type(connection, data)
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
         connection.close()
@@ -338,3 +340,28 @@ class Handler:
                 time.sleep(0.01)
         except Exception:
             connection.sendall(b"-ERR error processing 'blpop' command\r\n")
+
+    def handle_type(self, connection, data):
+        parts = data.split(b"\r\n")
+        try:
+            dollar_indices = [i for i, part in enumerate(parts) if part.startswith(b"$")]
+            if len(dollar_indices) < 2:
+                connection.sendall(b"-ERR wrong number of arguments for 'type' command\r\n")
+                return
+            key_index = dollar_indices[1] + 1
+            key = parts[key_index]
+            entry = self.dictionary.get(key)
+            if entry is None:
+                connection.sendall(b"+none\r\n")
+                return
+            value, expiry = entry
+            if expiry is not None and time.time() > expiry:
+                del self.dictionary[key]
+                connection.sendall(b"+none\r\n")
+                return
+            if isinstance(value, list):
+                connection.sendall(b"+list\r\n")
+            else:
+                connection.sendall(b"+string\r\n")
+        except Exception:
+            connection.sendall(b"-ERR error processing 'type' command\r\n")

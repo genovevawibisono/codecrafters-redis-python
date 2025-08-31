@@ -390,7 +390,6 @@ class Handler:
             return self.streams[stream_name]
         return None
 
-
     def handle_xadd(self, connection, data):
         parts = data.split(b"\r\n")
         try:
@@ -398,25 +397,93 @@ class Handler:
             if len(dollar_indices) < 4:
                 connection.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
                 return
+            
             stream_index = dollar_indices[1] + 1
             id_index = dollar_indices[2] + 1
-            field_value_start = dollar_indices[3] + 1
             stream_name = parts[stream_index]
             entry_id = parts[id_index]
+            
+            # Validation (only for non-auto-generated IDs)
+            if entry_id != b'*':
+                if not self.__validate_stream_id(entry_id):
+                    connection.sendall(b"-ERR invalid stream ID\r\n")
+                    return
+                
+                if not self.__check_id_greater_than_min(entry_id):
+                    connection.sendall(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
+                    return
+                
+                if stream_name not in self.streams:
+                    self.streams[stream_name] = []
+                
+                if len(self.streams[stream_name]) > 0:
+                    last_entry_id = self.streams[stream_name][-1][0]
+                    if not self.__check_id_greater_than(entry_id, last_entry_id):
+                        connection.sendall(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+                        return
+            
+            # Your existing field-value parsing logic:
             field_value_pairs = {}
-            for i in range(field_value_start, len(parts) - 1, 2):
-                field = parts[i]
-                value = parts[i + 1]
-                field_value_pairs[field] = value
+            for i in range(3, len(dollar_indices), 2):  # Start from index 3 (after stream, id)
+                if i + 1 < len(dollar_indices):
+                    field_index = dollar_indices[i] + 1
+                    value_index = dollar_indices[i + 1] + 1
+                    field = parts[field_index]
+                    value = parts[value_index]
+                    field_value_pairs[field] = value
+            
             if stream_name not in self.streams:
                 self.streams[stream_name] = []
+            
             if entry_id == b'*':
                 entry_id = uuid.uuid4().hex.encode()
+            
             entry = (entry_id, field_value_pairs)
             self.streams[stream_name].append(entry)
             response = b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
             connection.sendall(response)
+            
         except Exception:
-            connection.sendall(b"-ERR error processing 'xadd' command\r\n")         
+            connection.sendall(b"-ERR error processing 'xadd' command\r\n")
 
+    def __validate_stream_id(self, id):
+        parsed_id = id.split(b"-", 1)
+        if len(parsed_id) != 2:
+            return False
+        try:
+            # In milliseconds
+            timestamp = parsed_id[0]
+            # Sequence number
+            sequence_number = parsed_id[1]
+            validate_timestamp_res = self.__check_timestamp(timestamp)
+            validate_sequence_number_res = self.__check_sequence_number(sequence_number)
+            return validate_timestamp_res and validate_sequence_number_res
+        except Exception:
+            return False
+        
+    def __check_sequence_number(self, sequence_number):
+        try:
+            int(sequence_number)
+        except Exception:
+            return False
+        return True
+
+    def __check_timestamp(self, timestamp):
+        try:
+            int(timestamp)
+        except Exception:
+            return False
+        return True
     
+    def __check_id_greater_than_min(self, id):
+        return self.__check_id_greater_than(id, b"0-0")
+
+    def __check_id_greater_than(self, id1, id2):
+        if self.__validate_stream_id(id1) is False or self.__validate_stream_id(id2) is False:
+            return False
+        t1, s1 = id1.split(b"-", 1)
+        t2, s2 = id2.split(b"-", 1)
+        if int(t1) > int(t2):
+            return True
+        elif int(t1) == int(t2) and int(s1) > int(s2):
+            return True 

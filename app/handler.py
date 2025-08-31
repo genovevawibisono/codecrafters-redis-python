@@ -404,15 +404,23 @@ class Handler:
             entry_id = parts[id_index]
             
             # Handle different ID formats
-            if b"-*" in entry_id:
-                # Semi auto-generated (timestamp-*)
-                entry_id = self.__validation_semi_auto_generated(connection, stream_name, entry_id)
-                if entry_id is None:  # Validation failed
+            final_entry_id = None
+            
+            # Auto-generated ID (full auto-generation)
+            if entry_id == b'*':
+                curr_ms = self.__get_current_milliseconds()
+                final_entry_id = f"{curr_ms}-0".encode()
+            # Semi auto-generated ID (timestamp-*)
+            elif b"-*" in entry_id:
+                generated_id = self.__validation_semi_auto_generated(connection, stream_name, entry_id)
+                if generated_id is None:  # Validation failed
                     return
-            elif entry_id != b'*':
-                # Explicit ID validation
+                final_entry_id = generated_id
+            # Explicit ID
+            else:
                 if not self.__validation_non_auto_generated(connection, stream_name, entry_id):
                     return
+                final_entry_id = entry_id
             
             # Field-value parsing
             field_value_pairs = {}
@@ -424,15 +432,16 @@ class Handler:
                     value = parts[value_index]
                     field_value_pairs[field] = value
             
+            # Initialize stream if it doesn't exist
             if stream_name not in self.streams:
                 self.streams[stream_name] = []
             
-            if entry_id == b'*':
-                entry_id = uuid.uuid4().hex.encode()
-            
-            entry = (entry_id, field_value_pairs)
+            # Store the entry
+            entry = (final_entry_id, field_value_pairs)
             self.streams[stream_name].append(entry)
-            response = b"$" + str(len(entry_id)).encode() + b"\r\n" + entry_id + b"\r\n"
+            
+            # Send response with the actual ID that was used
+            response = b"$" + str(len(final_entry_id)).encode() + b"\r\n" + final_entry_id + b"\r\n"
             connection.sendall(response)
             
         except Exception:
@@ -533,4 +542,18 @@ class Handler:
         
         # Return next sequence number
         return max_sequence + 1
+    
+    def __validate_auto_generated_id(self):
+        curr_ms = self.__get_current_milliseconds()
+        entry_id = f"{curr_ms}-0"
+        return self.__validate_auto_generated_id_format(entry_id)
+    
+    def __get_current_milliseconds(self):
+        return int(time.time() * 1000)
+    
+    def __validate_auto_generated_id_format(self, value):
+        if value is None:
+            return b"$-1\r\n"
+        value_str = str(value)
+        return f"${len(value_str)}\r\n{value_str}\r\n"
             

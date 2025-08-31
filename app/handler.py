@@ -403,28 +403,20 @@ class Handler:
             stream_name = parts[stream_index]
             entry_id = parts[id_index]
             
-            # Validation (only for non-auto-generated IDs)
-            if entry_id != b'*':
-                if not self.__validate_stream_id(entry_id):
-                    connection.sendall(b"-ERR invalid stream ID\r\n")
+            # Handle different ID formats
+            if b"-*" in entry_id:
+                # Semi auto-generated (timestamp-*)
+                entry_id = self.__validation_semi_auto_generated(connection, stream_name, entry_id)
+                if entry_id is None:  # Validation failed
                     return
-                
-                if not self.__check_id_greater_than_min(entry_id):
-                    connection.sendall(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
+            elif entry_id != b'*':
+                # Explicit ID validation
+                if not self.__validation_non_auto_generated(connection, stream_name, entry_id):
                     return
-                
-                if stream_name not in self.streams:
-                    self.streams[stream_name] = []
-                
-                if len(self.streams[stream_name]) > 0:
-                    last_entry_id = self.streams[stream_name][-1][0]
-                    if not self.__check_id_greater_than(entry_id, last_entry_id):
-                        connection.sendall(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
-                        return
             
-            # Your existing field-value parsing logic:
+            # Field-value parsing
             field_value_pairs = {}
-            for i in range(3, len(dollar_indices), 2):  # Start from index 3 (after stream, id)
+            for i in range(3, len(dollar_indices), 2):
                 if i + 1 < len(dollar_indices):
                     field_index = dollar_indices[i] + 1
                     value_index = dollar_indices[i + 1] + 1
@@ -445,6 +437,48 @@ class Handler:
             
         except Exception:
             connection.sendall(b"-ERR error processing 'xadd' command\r\n")
+
+    def __validation_non_auto_generated(self, connection, stream_name, entry_id):
+        if not self.__validate_stream_id(entry_id):
+            connection.sendall(b"-ERR invalid stream ID\r\n")
+            return False
+        
+        if not self.__check_id_greater_than_min(entry_id):
+            connection.sendall(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
+            return False
+        
+        if stream_name not in self.streams:
+            self.streams[stream_name] = []
+        
+        if len(self.streams[stream_name]) > 0:
+            last_entry_id = self.streams[stream_name][-1][0]
+            if not self.__check_id_greater_than(entry_id, last_entry_id):
+                connection.sendall(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+                return False
+        
+        return True
+
+    def __validation_semi_auto_generated(self, connection, stream_name, entry_id):
+        timestamp_part = entry_id.split(b"-", 1)[0]
+        if not self.__check_timestamp(timestamp_part):
+            connection.sendall(b"-ERR invalid stream ID\r\n")
+            return None
+        
+        timestamp = int(timestamp_part)
+        next_sequence = self.__get_next_sequence_for_timestamp(stream_name, timestamp)
+        generated_id = timestamp_part + b'-' + str(next_sequence).encode()
+        return generated_id
+
+    def __check_id_greater_than(self, id1, id2):
+        if self.__validate_stream_id(id1) is False or self.__validate_stream_id(id2) is False:
+            return False
+        t1, s1 = id1.split(b"-", 1)
+        t2, s2 = id2.split(b"-", 1)
+        if int(t1) > int(t2):
+            return True
+        elif int(t1) == int(t2) and int(s1) > int(s2):
+            return True 
+        return False
 
     def __validate_stream_id(self, id):
         parsed_id = id.split(b"-", 1)
@@ -477,13 +511,26 @@ class Handler:
     
     def __check_id_greater_than_min(self, id):
         return self.__check_id_greater_than(id, b"0-0")
-
-    def __check_id_greater_than(self, id1, id2):
-        if self.__validate_stream_id(id1) is False or self.__validate_stream_id(id2) is False:
-            return False
-        t1, s1 = id1.split(b"-", 1)
-        t2, s2 = id2.split(b"-", 1)
-        if int(t1) > int(t2):
-            return True
-        elif int(t1) == int(t2) and int(s1) > int(s2):
-            return True 
+        
+    def __get_next_sequence_for_timestamp(self, stream_name, timestamp):
+        if stream_name not in self.streams:
+            # For timestamp 0, start with sequence 1, otherwise start with 0
+            return 1 if timestamp == 0 else 0
+        
+        # Find the highest sequence number for this timestamp
+        max_sequence = -1
+        for entry_id, _ in self.streams[stream_name]:
+            try:
+                entry_timestamp, entry_sequence = entry_id.split(b'-')
+                if int(entry_timestamp) == timestamp:
+                    max_sequence = max(max_sequence, int(entry_sequence))
+            except (ValueError, IndexError):
+                continue
+        
+        # If no entries found for this timestamp
+        if max_sequence == -1:
+            return 1 if timestamp == 0 else 0
+        
+        # Return next sequence number
+        return max_sequence + 1
+            
